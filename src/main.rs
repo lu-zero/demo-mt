@@ -14,10 +14,11 @@ struct F {
 
 const FRAME_CADENCE: Duration = Duration::from_millis(10);
 const SCENECHANGE_ANALYSIS: Duration = Duration::from_millis(20);
-const INVARANTS_BUILD: Duration = Duration::from_millis(70);
-const RDO: Duration = Duration::from_millis(200);
+const INVARANTS_BUILD: Duration = Duration::from_millis(50);
+const RDO: Duration = Duration::from_millis(100);
 
-const LOOKAHEAD: usize = 100;
+const LOOKAHEAD: usize = 50;
+const FRAMES: usize = 10000;
 
 fn producer(s: &thread::Scope, frames: usize, pb: ProgressBar) -> Receiver<F> {
     let (send, recv) = bounded(LOOKAHEAD * 2);
@@ -124,7 +125,8 @@ impl Worker {
     fn process(&self, sb: SB) {
         std::thread::sleep(INVARANTS_BUILD);
         self.pb.set_message(&format!(
-            "Processing {}..{}",
+            "({:02}) Processing {}..{}",
+            self.idx,
             sb.data[0].idx,
             sb.data.last().unwrap().idx
         ));
@@ -256,9 +258,12 @@ fn main() {
         .template("{prefix:.bold.dim} {spinner} {msg}");
 
     let _ = thread::scope(|s| {
-        let pb = m.add(ProgressBar::new(600));
-        pb.set_style(spinner_style.clone());
-        let f_recv = producer(s, 600, pb);
+        let pb_producer = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
+        let pb_packet = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
+        pb_producer.tick();
+        pb_packet.tick();
+
+        let f_recv = producer(s, FRAMES, pb_producer);
 
         let pb = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
         let sb_recv = scenechange(s, f_recv, pb);
@@ -266,13 +271,12 @@ fn main() {
         let m2 = Arc::clone(&m);
         let packet_recv = encode(s, sb_recv, m2);
 
-        let pb = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
         s.spawn(move |_| {
             for p in packet_recv.iter() {
-                pb.set_message(&format!("Packet {}", p.idx));
-                pb.inc(1);
+                pb_packet.set_message(&format!("Packet {}", p.idx));
+                pb_packet.inc(1);
             }
-            pb.finish_with_message("Complete");
+            pb_packet.finish_with_message("Complete");
         });
 
         s.spawn(move |_| {
