@@ -1,6 +1,8 @@
 use crossbeam::channel::*;
 use crossbeam::thread;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rand::distributions::Uniform;
+use rand::{thread_rng, Rng};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,8 +19,12 @@ const SCENECHANGE_ANALYSIS: Duration = Duration::from_millis(20);
 const INVARANTS_BUILD: Duration = Duration::from_millis(50);
 const RDO: Duration = Duration::from_millis(100);
 
+const MIN_KF: usize = 12;
+const MAX_KF: usize = 100;
+
 const LOOKAHEAD: usize = 50;
-const FRAMES: usize = 10000;
+const FRAMES: usize = 5000;
+const WORKERS: usize = 8;
 
 fn producer(s: &thread::Scope, frames: usize, pb: ProgressBar) -> Receiver<F> {
     let (send, recv) = bounded(LOOKAHEAD * 2);
@@ -50,13 +56,23 @@ struct SB {
 #[derive(Default)]
 struct SceneChange {
     frames: usize,
+    kf: usize,
+}
+
+impl SceneChange {
+    fn new() -> Self {
+        SceneChange {
+            frames: 0,
+            kf: MAX_KF,
+        }
+    }
 }
 
 // Assumptions:
 // the min-kf is always larger than the sub-gop size
 impl SceneChange {
     fn split(&mut self, l: &[F]) -> Option<(usize, bool)> {
-        let new_gop = self.frames != 0 && (self.frames % 100) == 0;
+        let new_gop = self.frames != 0 && (self.frames % self.kf) == 0;
         self.frames += 1;
 
         if l.len() > 7 {
@@ -74,8 +90,9 @@ fn scenechange(s: &thread::Scope, r: Receiver<F>, pb: ProgressBar) -> Receiver<S
     let (send, recv) = bounded(LOOKAHEAD / 7);
 
     s.spawn(move |_| {
+        let mut rng = thread_rng();
         let mut lookahead = Vec::new();
-        let mut sc = SceneChange::default();
+        let mut sc = SceneChange::new();
         let mut gop = 0;
         for f in r.iter() {
             lookahead.push(f);
@@ -84,6 +101,7 @@ fn scenechange(s: &thread::Scope, r: Receiver<F>, pb: ProgressBar) -> Receiver<S
                 let rem = lookahead.split_off(split_pos);
                 if end {
                     gop += 1;
+                    sc.kf = rng.sample(Uniform::new(MIN_KF, MAX_KF));
                 }
 
                 pb.set_message(&format!("gop {} sub gop of {}", gop, lookahead.len()));
@@ -231,7 +249,7 @@ fn reassemble(
 }
 
 fn encode(s: &thread::Scope, r: Receiver<SB>, m: Arc<MultiProgress>) -> Receiver<Packet> {
-    let (mut pool, recv) = WorkerPool::new(4, m);
+    let (mut pool, recv) = WorkerPool::new(WORKERS, m);
 
     let mut sb_send = pool.get_worker(s).unwrap();
 
