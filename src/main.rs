@@ -143,10 +143,11 @@ impl Worker {
     fn process(&self, sb: SB) {
         std::thread::sleep(INVARANTS_BUILD);
         self.pb.set_message(&format!(
-            "({:02}) Processing {}..{}",
+            "({:02}) Processing {}..{} tid {:?}",
             self.idx,
             sb.data[0].idx,
-            sb.data.last().unwrap().idx
+            sb.data.last().unwrap().idx,
+            rayon::current()
         ));
 
         for f in sb.data {
@@ -275,6 +276,12 @@ fn main() {
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
         .template("{prefix:.bold.dim} {spinner} {msg}");
 
+    let _ = rayon::ThreadPoolBuilder::new()
+        .start_handler(|idx| println!("Thread {}", idx))
+        .thread_name(|idx| format!("{}_usage", idx))
+        .num_threads(4)
+        .build_global();
+
     let _ = thread::scope(|s| {
         let pb_producer = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
         let pb_packet = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
@@ -290,9 +297,12 @@ fn main() {
         let packet_recv = encode(s, sb_recv, m2);
 
         s.spawn(move |_| {
+            let mut cur = 0;
             for p in packet_recv.iter() {
                 pb_packet.set_message(&format!("Packet {}", p.idx));
+                assert_eq!(cur, p.idx);
                 pb_packet.inc(1);
+                cur += 1;
             }
             pb_packet.finish_with_message("Complete");
         });
