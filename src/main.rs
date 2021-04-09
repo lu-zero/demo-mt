@@ -1,5 +1,4 @@
 use crossbeam::channel::*;
-use crossbeam::thread;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::distributions::Uniform;
 use rand::{thread_rng, Rng};
@@ -26,9 +25,9 @@ const LOOKAHEAD: usize = 50;
 const FRAMES: usize = 5000;
 const WORKERS: usize = 8;
 
-fn producer(s: &thread::Scope, frames: usize, pb: ProgressBar) -> Receiver<F> {
+fn producer(s: &rayon::ScopeFifo, frames: usize, pb: ProgressBar) -> Receiver<F> {
     let (send, recv) = bounded(LOOKAHEAD * 2);
-    s.spawn(move |_| {
+    s.spawn_fifo(move |_| {
         for idx in 0..frames {
             let f = F {
                 idx,
@@ -86,10 +85,10 @@ impl SceneChange {
     }
 }
 
-fn scenechange(s: &thread::Scope, r: Receiver<F>, pb: ProgressBar) -> Receiver<SB> {
+fn scenechange(s: &rayon::ScopeFifo, r: Receiver<F>, pb: ProgressBar) -> Receiver<SB> {
     let (send, recv) = bounded(LOOKAHEAD / 7);
 
-    s.spawn(move |_| {
+    s.spawn_fifo(move |_| {
         let mut rng = thread_rng();
         let mut lookahead = Vec::new();
         let mut sc = SceneChange::new();
@@ -196,7 +195,7 @@ impl WorkerPool {
         )
     }
 
-    fn get_worker(&mut self, s: &thread::Scope) -> Option<Sender<SB>> {
+    fn get_worker(&mut self, s: &rayon::ScopeFifo) -> Option<Sender<SB>> {
         self.recv_workers.recv().ok().map(|idx| {
             let (sb_send, sb_recv) = unbounded();
             let (send, recv) = unbounded();
@@ -216,7 +215,7 @@ impl WorkerPool {
                 pb,
             };
 
-            s.spawn(move |_| {
+            s.spawn_fifo(move |_| {
                 for sb in sb_recv.iter() {
                     w.process(sb);
                 }
@@ -231,11 +230,11 @@ impl WorkerPool {
 
 fn reassemble(
     recv_reassemble: Receiver<(usize, Receiver<Packet>)>,
-    s: &thread::Scope,
+    s: &rayon::ScopeFifo,
 ) -> Receiver<Packet> {
     let (send_packet, receive_packet) = unbounded();
 
-    s.spawn(move |_| {
+    s.spawn_fifo(move |_| {
         let mut pending = BTreeMap::new();
         let mut last_idx = 0;
         for (idx, recv) in recv_reassemble.iter() {
@@ -252,12 +251,12 @@ fn reassemble(
     receive_packet
 }
 
-fn encode(s: &thread::Scope, r: Receiver<SB>, m: Arc<MultiProgress>) -> Receiver<Packet> {
+fn encode(s: &rayon::ScopeFifo, r: Receiver<SB>, m: Arc<MultiProgress>) -> Receiver<Packet> {
     let (mut pool, recv) = WorkerPool::new(WORKERS, m);
 
     let mut sb_send = pool.get_worker(s).unwrap();
 
-    s.spawn(move |s| {
+    s.spawn_fifo(move |s| {
         for sb in r.iter() {
             let end_gop = sb.end_gop;
 
@@ -279,13 +278,17 @@ fn main() {
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
         .template("{prefix:.bold.dim} {spinner} {msg}");
 
+    // producer, scenechange, encode, reassemble , packet_recv, ui
+    let long_winded_threads = 6;
+    let workers = 4;
+
     let _ = rayon::ThreadPoolBuilder::new()
-        .start_handler(|idx| println!("Thread {}", idx))
-        .thread_name(|idx| format!("{}_usage", idx))
-        .num_threads(4)
+        // .start_handler(|idx| println!("Thread {}", idx))
+        // .thread_name(|idx| format!("{}_usage", idx))
+        .num_threads(long_winded_threads + workers)
         .build_global();
 
-    let _ = thread::scope(|s| {
+    let _ = rayon::scope_fifo(|s| {
         let pb_producer = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
         let pb_packet = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
         pb_producer.tick();
@@ -299,7 +302,7 @@ fn main() {
         let m2 = Arc::clone(&m);
         let packet_recv = encode(s, sb_recv, m2);
 
-        s.spawn(move |_| {
+        s.spawn_fifo(move |_| {
             let mut cur = 0;
             for p in packet_recv.iter() {
                 pb_packet.set_message(&format!("Packet {}", p.idx));
@@ -310,7 +313,7 @@ fn main() {
             pb_packet.finish_with_message("Complete");
         });
 
-        s.spawn(move |_| {
+        s.spawn_fifo(move |_| {
             m.join_and_clear().unwrap();
         });
     });
