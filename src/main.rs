@@ -22,7 +22,7 @@ const MIN_KF: usize = 12;
 const MAX_KF: usize = 100;
 
 const LOOKAHEAD: usize = 50;
-const FRAMES: usize = 5000;
+const FRAMES: usize = 500;
 const WORKERS: usize = 8;
 
 fn producer(s: &rayon::ScopeFifo, frames: usize, pb: ProgressBar) -> Receiver<F> {
@@ -131,95 +131,87 @@ struct Packet {
     idx: usize,
 }
 
-struct Worker {
-    idx: usize,
-    back: Sender<usize>,
+struct WorkLoad {
+    sb_recv: Receiver<SB>,
     send: Sender<Packet>,
-    pb: ProgressBar,
-}
-
-impl Worker {
-    fn process(&self, sb: SB) {
-        use rayon::prelude::*;
-        std::thread::sleep(INVARANTS_BUILD);
-        self.pb.set_message(&format!(
-            "({:02}) Processing {}..{} tid {:?}",
-            self.idx,
-            sb.data[0].idx,
-            sb.data.last().unwrap().idx,
-            rayon::current()
-        ));
-
-        for f in sb.data {
-            sleep(RDO);
-            (0..16).into_par_iter().for_each(|_| {
-                self.pb.inc(1);
-            });
-            let _ = self.send.send(Packet { idx: f.idx });
-        }
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        let _ = self.back.send(self.idx);
-    }
 }
 
 struct WorkerPool {
-    send_workers: Sender<usize>,
-    recv_workers: Receiver<usize>,
+    recv_workers: Receiver<Sender<WorkLoad>>,
     send_reassemble: Sender<(usize, Receiver<Packet>)>,
-    m: Arc<MultiProgress>,
     count: usize,
 }
 
 impl WorkerPool {
-    fn new(workers: usize, m: Arc<MultiProgress>) -> (Self, Receiver<(usize, Receiver<Packet>)>) {
+    fn new(
+        s: &rayon::ScopeFifo,
+        workers: usize,
+        m: Arc<MultiProgress>,
+    ) -> (Self, Receiver<(usize, Receiver<Packet>)>) {
         let (send_workers, recv_workers) = bounded(workers);
         let (send_reassemble, recv_reassemble) = unbounded();
-
         for w in 0..workers {
-            let _ = send_workers.send(w);
+            let (send_workload, recv_workload) = unbounded::<WorkLoad>();
+            let spinner_style = ProgressStyle::default_spinner()
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+                .template("  {prefix:.bold.dim} {spinner} {msg}");
+
+            let pb = m.add(ProgressBar::new(!0).with_style(spinner_style));
+
+            let send_workload2 = send_workload.clone();
+            let send_back = send_workers.clone();
+            s.spawn_fifo(move |_| {
+                pb.set_message(&format!("Starting worker {}", w));
+                for wl in recv_workload.iter() {
+                    let mut never_in = true;
+                    for sb in wl.sb_recv.iter() {
+                        use rayon::prelude::*;
+                        std::thread::sleep(INVARANTS_BUILD);
+                        pb.set_message(&format!(
+                            "({:02}) Processing {}..{} {:?}",
+                            w,
+                            sb.data[0].idx,
+                            sb.data.last().unwrap().idx,
+                            rayon::current()
+                        ));
+
+                        for f in sb.data {
+                            sleep(RDO);
+                            (0..16).into_par_iter().for_each(|_| {
+                                pb.inc(1);
+                            });
+                            let _ = wl.send.send(Packet { idx: f.idx });
+                        }
+                        never_in = false;
+                    }
+                    pb.set_message(&format!("Adding back {} {}", w, never_in));
+                    let _ = send_back.send(send_workload2.clone());
+                }
+                pb.set_message(&format!("Complete {}", w));
+            });
+            let _ = send_workers.send(send_workload);
         }
 
         (
             WorkerPool {
-                send_workers,
                 recv_workers,
                 send_reassemble,
-                m,
                 count: 0,
             },
             recv_reassemble,
         )
     }
 
-    fn get_worker(&mut self, s: &rayon::ScopeFifo) -> Option<Sender<SB>> {
-        self.recv_workers.recv().ok().map(|idx| {
+    fn get_worker(&mut self) -> Option<Sender<SB>> {
+        self.recv_workers.recv().ok().map(|sender| {
             let (sb_send, sb_recv) = unbounded();
             let (send, recv) = unbounded();
 
             let _ = self.send_reassemble.send((self.count, recv));
 
-            let spinner_style = ProgressStyle::default_spinner()
-                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-                .template("  {prefix:.bold.dim} {spinner} {msg}");
+            let wl = WorkLoad { sb_recv, send };
 
-            let pb = self.m.add(ProgressBar::new(!0).with_style(spinner_style));
-
-            let w = Worker {
-                idx,
-                back: self.send_workers.clone(),
-                send,
-                pb,
-            };
-
-            s.spawn_fifo(move |_| {
-                for sb in sb_recv.iter() {
-                    w.process(sb);
-                }
-            });
+            let _ = sender.send(wl);
 
             self.count += 1;
 
@@ -252,20 +244,21 @@ fn reassemble(
 }
 
 fn encode(s: &rayon::ScopeFifo, r: Receiver<SB>, m: Arc<MultiProgress>) -> Receiver<Packet> {
-    let (mut pool, recv) = WorkerPool::new(WORKERS, m);
+    let pb = m.add(ProgressBar::new(!0));
+    let (mut pool, recv) = WorkerPool::new(s, WORKERS, m);
 
-    let mut sb_send = pool.get_worker(s).unwrap();
-
-    s.spawn_fifo(move |s| {
+    s.spawn_fifo(move |_| {
+        let mut sb_send = pool.get_worker().unwrap();
         for sb in r.iter() {
             let end_gop = sb.end_gop;
 
             let _ = sb_send.send(sb);
 
             if end_gop {
-                sb_send = pool.get_worker(s).unwrap();
+                sb_send = pool.get_worker().unwrap();
             }
         }
+        pb.println(&format!("Workers {}", pool.recv_workers.len()));
     });
 
     reassemble(recv, s)
@@ -280,7 +273,7 @@ fn main() {
 
     // producer, scenechange, encode, reassemble , packet_recv, ui
     let long_winded_threads = 6;
-    let workers = 4;
+    let workers = WORKERS;
 
     let pool = rayon::ThreadPoolBuilder::new()
         // .start_handler(|idx| println!("Thread {}", idx))
