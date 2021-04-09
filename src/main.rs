@@ -282,13 +282,14 @@ fn main() {
     let long_winded_threads = 6;
     let workers = 4;
 
-    let _ = rayon::ThreadPoolBuilder::new()
+    let pool = rayon::ThreadPoolBuilder::new()
         // .start_handler(|idx| println!("Thread {}", idx))
         // .thread_name(|idx| format!("{}_usage", idx))
         .num_threads(long_winded_threads + workers)
-        .build_global();
+        .build()
+        .unwrap();
 
-    let _ = rayon::scope_fifo(|s| {
+    let _ = pool.scope_fifo(|s| {
         let pb_producer = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
         let pb_packet = m.add(ProgressBar::new(!0).with_style(spinner_style.clone()));
         pb_producer.tick();
