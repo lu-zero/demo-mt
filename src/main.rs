@@ -141,6 +141,7 @@ struct Worker {
 
 impl Worker {
     fn process(&self, sb: SB) {
+        use rayon::prelude::*;
         std::thread::sleep(INVARANTS_BUILD);
         self.pb.set_message(&format!(
             "({:02}) Processing {}..{} tid {:?}",
@@ -152,7 +153,9 @@ impl Worker {
 
         for f in sb.data {
             sleep(RDO);
-            self.pb.inc(1);
+            (0..16).into_par_iter().for_each(|_| {
+                self.pb.inc(1);
+            });
             let _ = self.send.send(Packet { idx: f.idx });
         }
     }
